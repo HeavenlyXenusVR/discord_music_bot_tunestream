@@ -5193,13 +5193,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                         wav_filters.timescale.set(speed=c_speed, pitch=c_pitch)
                         c_mod_left -= 1
                         await cur.execute("UPDATE tunestream_guild_settings SET custom_modifiers_left = %s WHERE guild_id = %s", (c_mod_left, guild.id))
-                        if c_mod_left == 0 and interaction.guild.id in playback_tracking: pass
-                    playback_tracking[interaction.guild.id]["speed"] = speed
-                    update_runtime_position_baseline(interaction.guild.id, current_track_position(interaction.guild.id))
-                    if interaction.guild.id in playback_tracking:
-                        playback_tracking[interaction.guild.id]["speed"] = speed
-                        update_runtime_position_baseline(interaction.guild.id, current_track_position(interaction.guild.id))
-                    await cur.execute("UPDATE tunestream_guild_settings SET custom_speed = 1.0, custom_pitch = 1.0 WHERE guild_id = %s", (guild.id,))
+                        if c_mod_left == 0: await cur.execute("UPDATE tunestream_guild_settings SET custom_speed = 1.0, custom_pitch = 1.0 WHERE guild_id = %s", (guild.id,))
 
                     c_speed = apply_filter_preset(wav_filters, filter_mode, c_speed)
 
@@ -8034,20 +8028,23 @@ async def direct_order_listener():
 
             for finalize_attempt in range(DIRECT_ORDER_DB_RETRY_ATTEMPTS):
                 try:
+                    async with DBPoolManager() as _fin_pool:
+                        async with _fin_pool.acquire() as _fin_conn:
+                            async with _fin_conn.cursor() as _fin_cur:
                                 try:
-                                    await cur.execute("START TRANSACTION")
+                                    await _fin_cur.execute("START TRANSACTION")
                                     if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
-                                        await cur.execute("DELETE FROM tunestream_swarm_direct_orders WHERE id = %s", (oid,))
+                                        await _fin_cur.execute("DELETE FROM tunestream_swarm_direct_orders WHERE id = %s", (oid,))
                                     else:
-                                        await cur.execute("UPDATE tunestream_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
-                                    await cur.execute("COMMIT")
+                                        await _fin_cur.execute("UPDATE tunestream_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
+                                    await _fin_cur.execute("COMMIT")
                                 except Exception as tx_error:
                                     try:
-                                        await cur.execute("ROLLBACK")
-                                    except Exception as tx_error:
+                                        await _fin_cur.execute("ROLLBACK")
+                                    except Exception:
                                         pass
                                     raise
-                                break
+                    break
                 except Exception as exc:
                     if _is_retryable_mysql_error(exc) and finalize_attempt + 1 < DIRECT_ORDER_DB_RETRY_ATTEMPTS:
                         logger.warning(
