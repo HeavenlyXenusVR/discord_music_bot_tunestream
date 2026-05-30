@@ -5232,7 +5232,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     # Seed runtime tracking immediately after Lavalink accepts play(), before resume seek verification.
                     # This protects long-track resume points if Discord voice drops or the checkpoint loop runs
                     # during the seek/verification window. The final block below overwrites this provisional state.
-                    playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
+                    playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
                     guild_states[guild.id] = {"voice_channel_id": channel_id, "position": start_position, "track_uid": track_uid, "url": url, "title": title}
                     invalidate_position_persist(guild.id)
                     if start_position > 0:
@@ -5267,7 +5267,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except Exception as tx_error:
                     pass
-                playback_tracking[guild.id] = {'start_time': time.time(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
+                playback_tracking[guild.id] = {'start_time': time.monotonic(), 'offset': start_position, 'url': url, 'channel_id': channel_id, 'title': title, 'track_uid': track_uid, 'original_queue_url': original_queue_url, 'original_queue_title': original_queue_title, 'duration': duration, 'speed': c_speed, 'current_filter': filter_mode, 'requester_id': requester_id, 'transition_mode': trans_mode, 'volume': vol, 'paused': False, 'last_position_checkpoint': start_position, 'last_listen_position': start_position, 'listen_seconds_committed': 0}
                 clear_live_queue_claim(guild.id, original_queue_url, original_queue_title, track_uid)
 
                 bot_n = os.path.basename(__file__).replace('.py', '')
@@ -5334,7 +5334,7 @@ async def stop_playback(guild):
     clear_recovery_retry(guild.id)
     clear_interrupt_resume(guild.id)
     clear_voice_disconnect_grace(guild.id)
-    clear_idle_restore_state(member.guild.id)
+    clear_idle_restore_state(guild.id)
     process_queue_locks.pop(member.guild.id, None)
     track_requeue_locks.pop(member.guild.id, None)
     voice_connect_locks.pop(member.guild.id, None)
@@ -5746,7 +5746,7 @@ async def on_voice_state_update(member, before, after):
         clear_recovery_retry(guild_id)
         clear_interrupt_resume(guild_id)
         clear_voice_disconnect_grace(guild_id)
-        clear_idle_restore_state(member.guild.id)
+        clear_idle_restore_state(guild.id)
 
         await mark_voice_disconnected(guild_id, getattr(before.channel, "id", None), desired_connected=False, reason="manual_or_idle_disconnect")
         await delete_state(guild_id)
@@ -7609,7 +7609,7 @@ async def resilience_loop():
                         queue_count = queue_count_row[0] if queue_count_row else 0
 
                         if queue_count > 0:
-                            clear_idle_restore_state(member.guild.id)
+                            clear_idle_restore_state(guild.id)
 
 
                         if is_active:
@@ -7658,7 +7658,7 @@ async def resilience_loop():
                         if target_channel_id:
                             idle_voice_since.setdefault(guild.id, now)
                         else:
-                            clear_idle_restore_state(member.guild.id)
+                            clear_idle_restore_state(guild.id)
 
 
                         long_idle = bool(target_channel_id) and now - idle_voice_since.get(guild.id, now) >= AUTO_IMPORT_IDLE_SECONDS
@@ -7679,7 +7679,7 @@ async def resilience_loop():
                         )
                         if not has_recovery_playback:
                             await cur.execute("DELETE FROM tunestream_queue_backup WHERE guild_id = %s AND bot_name = 'tunestream'", (guild.id,))
-                            clear_idle_restore_state(member.guild.id)
+                            clear_idle_restore_state(guild.id)
 
                             continue
 
@@ -7689,7 +7689,7 @@ async def resilience_loop():
 
                         restore_position = normalize_position_seconds(playback_row[2] if playback_row else 0)
                         await remember_recovery_state(guild.id, target_channel_id, restore_position)
-                        clear_idle_restore_state(member.guild.id)
+                        clear_idle_restore_state(guild.id)
 
                         scheduled = schedule_recovery_retry(guild.id, target_channel_id, start_position=restore_position, reason="idle_restore")
                         if scheduled:
@@ -7735,7 +7735,7 @@ async def zombie_reaper_loop():
                                         await remember_recovery_state(guild.id, recovery_channel_id, restore_position)
                                         restored = await restore_queue_from_backup(cur, guild.id)
                                         if restored > 0:
-                                            clear_idle_restore_state(member.guild.id)
+                                            clear_idle_restore_state(guild.id)
 
                                             scheduled = schedule_recovery_retry(guild.id, recovery_channel_id, start_position=restore_position, reason="zombie_restore")
                                             if scheduled:
@@ -8141,9 +8141,12 @@ class SwarmIntelligence(commands.Cog):
     @tasks.loop(seconds=30)
     async def heartbeat(self):
         try:
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
                         await cur.execute("INSERT INTO swarm_health (bot_name, status, last_pulse) VALUES (%s, 'HEALTHY', NOW()) ON DUPLICATE KEY UPDATE status=VALUES(status), last_pulse=NOW()", (self.bot_name,))
         except Exception as tx_error:
-            logger.exception("[tunestream] Heartbeat update failed.")
+            logger.exception("[%s] Heartbeat update failed.", self.bot_name)
 
     @tasks.loop(seconds=15)
     async def watchdog(self):
