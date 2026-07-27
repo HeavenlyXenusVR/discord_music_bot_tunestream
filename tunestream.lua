@@ -941,6 +941,55 @@ end
 
 local maybe_enqueue_autodj -- forward decl
 
+-- Port of alucard.py's update_stage_topic/clear_voice_channel_status: without
+-- this, a stage channel just sits showing "waiting" in Discord's UI and the
+-- member list never shows what's playing, even though audio is flowing fine
+-- -- these are purely cosmetic Discord-side signals, not required for audio,
+-- but users expect them. Channel type is memoized since it never changes.
+local channel_kind_cache = {} -- channel_id -> "stage" | "voice"
+local last_stage_topic = {}   -- guild_id -> last topic string sent (dedup)
+
+local function get_channel_kind(channel_id)
+  if not channel_id then return "voice" end
+  local cached = channel_kind_cache[channel_id]
+  if cached then return cached end
+  local ch = bot.rest:get("/channels/" .. tostring(channel_id))
+  local kind = (ch and ch.type == 13) and "stage" or "voice"
+  channel_kind_cache[channel_id] = kind
+  return kind
+end
+
+local function update_stage_topic(guild_id, channel_id, title)
+  if not channel_id then return end
+  local ok, err = pcall(function()
+    local safe_title = tostring(title or "Unknown Track"):gsub("\n", " "):sub(1, 60)
+    local topic = "\xF0\x9F\x8E\xB5 " .. safe_title
+    if last_stage_topic[guild_id] == topic then return end
+    if get_channel_kind(channel_id) == "stage" then
+      local patched = bot.rest:patch("/stage-instances/" .. tostring(channel_id), { topic = topic })
+      if not patched then
+        bot.rest:post("/stage-instances", { channel_id = tostring(channel_id), topic = topic, privacy_level = 2 })
+      end
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = topic })
+    end
+    last_stage_topic[guild_id] = topic
+  end)
+  if not ok then log_warn("[%s] stage/voice topic update failed: %s", guild_id, tostring(err)) end
+end
+
+local function clear_stage_topic(guild_id, channel_id)
+  last_stage_topic[guild_id] = nil
+  if not channel_id then return end
+  pcall(function()
+    if get_channel_kind(channel_id) == "stage" then
+      bot.rest:delete("/stage-instances/" .. tostring(channel_id))
+    else
+      bot.rest:patch("/channels/" .. tostring(channel_id), { status = cjson.null })
+    end
+  end)
+end
+
 -- Pops the next track from tunestream_queue and starts it. If the queue is empty,
 -- tries to restore from tunestream_queue_backup (loop_mode == queue), else runs
 -- Auto-DJ, else disconnects (unless 24/7 mode is on).
@@ -967,6 +1016,7 @@ local function process_queue(guild_id, channel_id)
           WHERE guild_id = %s AND bot_name = 'tunestream']], guild_id)
       playback[guild_id] = nil
       if maybe_enqueue_autodj(guild_id, channel_id) then return end
+      clear_stage_topic(guild_id, channel_id)
       if not settings.stay_in_vc then
         bot.lavalink:destroy_player(guild_id)
         bot.gateway:leave_voice(guild_id)
@@ -1014,6 +1064,8 @@ local function process_queue(guild_id, channel_id)
       volume = use_fade and 0 or target_volume,
       filters = filters,
     })
+
+    update_stage_topic(guild_id, channel_id, track.title or title)
 
     playback[guild_id] = {
       url = track.uri or url, title = track.title or title, duration = (track.length_ms or 0) / 1000,
@@ -1065,6 +1117,7 @@ end
 
 local function stop_playback(guild_id)
   bot.lavalink:stop(guild_id)
+  clear_stage_topic(guild_id, playback[guild_id] and playback[guild_id].channel_id or get_home_channel_id(guild_id))
   playback[guild_id] = nil
   process_queue_busy[guild_id] = nil
 end
@@ -2533,6 +2586,27 @@ end
 
 bot.gateway:on("READY", function()
   send_webhook_log("\xF0\x9F\x9F\xA2 Node Online", "TUNESTREAM is online and syncing with the swarm.", COLOR.green)
+  -- Rejoin and resume for any guild that was playing (or had a non-empty
+  -- queue) when this process last stopped -- container recreates/restarts
+  -- otherwise leave the bot sitting disconnected with a full queue and no
+  -- way back in short of a manual /play.
+  copas.addthread(function()
+    copas.sleep(2) -- let the gateway session settle before opening voice
+    local rows = q("SELECT DISTINCT guild_id FROM tunestream_bot_home_channels WHERE bot_name = 'tunestream'") or {}
+    for _, row in ipairs(rows) do
+      local gid = row.guild_id
+      local channel_id = get_home_channel_id(gid)
+      if channel_id then
+        local has_queue = queue_count(gid) > 0
+        local was_playing = q1("SELECT is_playing FROM tunestream_playback_state WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+        if has_queue or (was_playing and was_playing.is_playing) then
+          log_info("[%s] resuming on boot (queue=%s, was_playing=%s)", gid, tostring(has_queue), tostring(was_playing and was_playing.is_playing))
+          ensure_voice_connection(gid, channel_id)
+          process_queue(gid, channel_id)
+        end
+      end
+    end
+  end)
 end)
 
 -- ===========================================================================
