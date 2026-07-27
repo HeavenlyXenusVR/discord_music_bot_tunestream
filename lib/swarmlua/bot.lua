@@ -2,11 +2,13 @@
 -- Each bot's own file uses this to register slash commands and handlers;
 -- everything protocol-level lives in this shared library so behavior stays
 -- consistent across all 13 bots while each bot's command set stays unique.
+
 -- LuaJIT fully block-buffers stdout when it isn't a TTY (true for every
 -- Docker container), so `docker logs` can sit there showing nothing -- or a
 -- stale snapshot -- long after the bot has actually connected, including
 -- hiding real crash output. Force line buffering so logs/print show up as
--- they happen.
+-- they happen. This module is required near the top of every bot's
+-- entrypoint, before any real connection logic runs.
 io.stdout:setvbuf("line")
 io.stderr:setvbuf("line")
 
@@ -85,7 +87,18 @@ function Bot:run()
     if self.application_id then self:sync_commands() end
     if self.lavalink then
       self.lavalink.user_id = self.user_id
-      self.lavalink:connect()
+      -- READY refires on every fresh gateway IDENTIFY (invalid session,
+      -- post-reconnect re-auth, etc), which happens often. Lavalink:connect()
+      -- opens a brand new session each call without closing the previous
+      -- one, so calling it again here would leave old orphaned sessions
+      -- around and make self.lavalink.session_id race between them --
+      -- update_player/play would then target whichever session's "ready"
+      -- op happened to land last, which may have no live voice connection,
+      -- so playback silently fails even with a full queue. Connect once.
+      if not self.lavalink_connected then
+        self.lavalink_connected = true
+        self.lavalink:connect()
+      end
     end
   end)
 
