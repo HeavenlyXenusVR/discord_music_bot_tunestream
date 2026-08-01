@@ -139,11 +139,29 @@ local LOG_DIR = env(PREFIX .. "_LOG_DIR", env("MUSIC_BOT_LOG_DIR", "/app/logs"))
 pcall(function() os.execute("mkdir -p '" .. LOG_DIR .. "'") end)
 local LOG_FILE = LOG_DIR .. "/tunestream.log"
 
+-- Matches alucard.py's RotatingFileHandler (10MB x 5 backups by default,
+-- same env var names) -- LOG_FILE previously grew unbounded forever.
+local LOG_MAX_BYTES = tonumber(env("MUSIC_BOT_LOG_MAX_BYTES", "10485760")) or 10485760
+local LOG_BACKUP_COUNT = tonumber(env("MUSIC_BOT_LOG_BACKUP_COUNT", "5")) or 5
+
+local function rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local size = f:seek("end")
+  f:close()
+  if not size or size < LOG_MAX_BYTES then return end
+  for i = LOG_BACKUP_COUNT - 1, 1, -1 do
+    os.rename(LOG_FILE .. "." .. i, LOG_FILE .. "." .. (i + 1))
+  end
+  os.rename(LOG_FILE, LOG_FILE .. ".1")
+end
+
 local function logline(level, fmt, ...)
   local ok, msg = pcall(string.format, fmt, ...)
   if not ok then msg = fmt end
   local line = string.format("%s %-5s tunestream %s", os.date("%Y-%m-%d %H:%M:%S"), level, msg)
   print(line)
+  rotate_log_if_needed()
   local f = io.open(LOG_FILE, "a")
   if f then f:write(line .. "\n"); f:close() end
 end
@@ -2573,11 +2591,60 @@ local function heartbeat_tick()
   end
 end
 
+-- SwarmPanel/Aria remote-control bridge -- was entirely missing, so the
+-- panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons silently did nothing for
+-- this bot. Same poll-and-execute-then-delete pattern as alucard.lua/
+-- gws.lua/sapphire.lua.
+local function poll_swarm_overrides()
+  local rows = q("SELECT guild_id, command FROM tunestream_swarm_overrides WHERE bot_name = 'tunestream'") or {{}}
+  for _, row in ipairs(rows) do
+    local guild_id = tostring(row.guild_id)
+    local cmd_name = (row.command or ""):upper()
+    local executed = false
+    if cmd_name == "RESTART" then
+      q("DELETE FROM tunestream_swarm_overrides WHERE guild_id = %s AND bot_name = 'tunestream'", guild_id)
+      send_webhook_log("\240\159\164\150 Aria Override", "Aria requested a restart.", COLOR.purple)
+      os.exit(0)
+    elseif cmd_name == "PAUSE" and playback[guild_id] and not playback[guild_id].paused then
+      playback[guild_id].paused = true
+      playback[guild_id].offset = current_position(guild_id)
+      bot.lavalink:set_paused(guild_id, true)
+      executed = true
+    elseif cmd_name == "RESUME" and playback[guild_id] and playback[guild_id].paused then
+      playback[guild_id].paused = false
+      playback[guild_id].start_time = socket.gettime()
+      bot.lavalink:set_paused(guild_id, false)
+      executed = true
+    elseif cmd_name == "SKIP" and playback[guild_id] then
+      bot.lavalink:stop(guild_id)
+      executed = true
+    elseif cmd_name == "STOP" then
+      stop_playback(guild_id)
+      executed = true
+    end
+    if executed then
+      send_webhook_log("\240\159\164\150 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
+    end
+    q("DELETE FROM tunestream_swarm_overrides WHERE guild_id = %s AND bot_name = 'tunestream' AND command = %s", guild_id, row.command)
+  end
+end
+
 local function start_background_loops()
   copas.addthread(function()
     while true do
       copas.sleep(10)
       persist_positions_tick()
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(10)
+      local ok, err = pcall(poll_swarm_overrides)
+      if not ok then
+        log_warn("swarm override poll error: %s", tostring(err))
+        report_error(nil, "runtime", "swarm override poll error", tostring(err))
+      end
     end
   end)
 
@@ -2604,7 +2671,18 @@ local function start_background_loops()
   end)
 end
 
+-- BUGFIX: the Discord gateway sends a fresh READY (not RESUMED) on every
+-- invalidated session -- routine reconnects, not just process restarts --
+-- and this handler used to redo its full boot-resume/background-loop-spawn
+-- pass every single time, which both force-restarted/discarded queued
+-- tracks on reconnect and piled up duplicate background loops. Gate on
+-- did_initial_ready so it runs exactly once per process (matching what it was
+-- actually written for).
+local did_initial_ready = false
+
 bot.gateway:on("READY", function()
+  if did_initial_ready then return end
+  did_initial_ready = true
   send_webhook_log("\xF0\x9F\x9F\xA2 Node Online", "TUNESTREAM is online and syncing with the swarm.", COLOR.green)
   -- Rejoin and resume for any guild that was playing (or had a non-empty
   -- queue) when this process last stopped -- container recreates/restarts
