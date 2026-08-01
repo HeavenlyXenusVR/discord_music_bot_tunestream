@@ -53,9 +53,9 @@
       scoring model (see "Smart Auto-DJ" section) driven by
       tunestream_track_intelligence / tunestream_user_track_affinity counters
       instead of semantic embedding similarity.
-    - The Aria/SwarmPanel remote-control bridge (tunestream_swarm_direct_orders,
-      tunestream_swarm_overrides, direct_order_listener/aria_command_listener) --
-      this bot is controlled directly via its own Discord slash commands only.
+    - The Aria/SwarmPanel remote-control bridge is ported: see
+      poll_swarm_overrides (tunestream_swarm_overrides) and
+      poll_direct_orders/handle_direct_order (tunestream_swarm_direct_orders).
     - "Live playlist sync" (tunestream_active_playlist_tracks, the background
       task that re-scans a queued playlist URL for newly-added videos) --
       /tunestream_main_play expands a playlist once, in full, at queue time via
@@ -292,6 +292,18 @@ local function init_db()
       ON CONFLICT (guild_id) DO NOTHING]], 0)
   -- the above is a harmless no-op probe (guild_id=0) just to confirm the table/columns are reachable
   q("DELETE FROM tunestream_guild_settings WHERE guild_id = %s", 0)
+  -- Live playlist sync (see playlist_sync_tick() below) -- these tables
+  -- existed in name only before (this Lua rewrite never had its own
+  -- schema-bootstrap pass for them).
+  q([[CREATE TABLE IF NOT EXISTS tunestream_active_playlists (
+        guild_id BIGINT, bot_name VARCHAR(50) DEFAULT 'tunestream', playlist_url TEXT,
+        known_track_count INT DEFAULT 0, requester_id BIGINT, channel_id BIGINT,
+        PRIMARY KEY (guild_id, bot_name))]])
+  q([[CREATE TABLE IF NOT EXISTS tunestream_active_playlist_tracks (
+        guild_id BIGINT, bot_name VARCHAR(50) DEFAULT 'tunestream', playlist_url TEXT,
+        position_idx INT DEFAULT 0, track_key VARCHAR(64), track_uid VARCHAR(32),
+        video_url TEXT, title TEXT, requester_id BIGINT)]])
+  q("CREATE INDEX IF NOT EXISTS tunestream_active_playlist_tracks_lookup_idx ON tunestream_active_playlist_tracks (guild_id, bot_name)")
   log_info("database reachable, schema looks good")
 end
 
@@ -812,6 +824,240 @@ local function restore_queue_from_backup(guild_id)
       guild_id, r.video_url, r.title, r.requester_id, col(r, "track_uid") or new_uid())
   end
   return #rows
+end
+
+-- ===========================================================================
+-- Live playlist sync: auto-add newly appeared tracks / auto-remove tracks
+-- gone from a queued playlist's source. Ported from alucard.py's
+-- playlist_sync_loop -- this was cut fleet-wide during the Lua rewrite
+-- (tunestream_active_playlists existed only as inert per-guild metadata,
+-- written to by nothing but the DELETE calls scattered through /stop,
+-- /clear, sleep-timer-elapsed, and queue-drained; is_playlist_source() was
+-- defined but never called). Simplified vs. the Python original: no
+-- YouTube Data API path (this stack only has Lavalink), so every
+-- re-extraction is treated as equally trustworthy and a removal always
+-- requires 2 consecutive missing cycles rather than distinguishing an
+-- "API-trusted" cycle from a truncating-fallback one.
+-- ===========================================================================
+
+local PLAYLIST_SYNC_INTERVAL = tonumber(env("PLAYLIST_SYNC_INTERVAL", "30")) or 30
+local PLAYLIST_SYNC_MAX_TRACKED = tonumber(env("PLAYLIST_SYNC_MAX_TRACKED", "500")) or 500
+local PLAYLIST_QUEUE_MIN_TRACKS = tonumber(env("PLAYLIST_QUEUE_MIN_TRACKS", "20")) or 20
+local playlist_missing_streak = {} -- guild_id -> {track_key -> consecutive cycles missing}
+
+local function clear_active_playlist(guild_id)
+  q("DELETE FROM tunestream_active_playlists WHERE guild_id = %s AND bot_name = 'tunestream'", guild_id)
+  q("DELETE FROM tunestream_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'tunestream'", guild_id)
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- track_key() itself caps at 64 chars (matches tunestream_track_intelligence's
+-- url_key VARCHAR(64)), but tunestream_active_playlist_tracks.track_key is a
+-- pre-existing CHAR(40) column -- overflowing it fails the INSERT, and
+-- since that happened on every row of every playlist sync, it also tripped
+-- the pg.lua reconnect-storm bug fixed above (same failure, same query, in
+-- a loop). CHAR (not VARCHAR) also blank-pads on read, so values coming
+-- back out of this column need trimming before comparing them against a
+-- freshly computed key.
+local function playlist_track_key(url, title)
+  local k = track_key(url, title)
+  if #k > 40 then k = k:sub(1, 40) end
+  return k
+end
+
+-- Called right after a /play (or equivalent) call resolves to a real
+-- Lavalink loadType=playlist response -- registers it so playlist_sync_tick
+-- starts watching it for adds/removals.
+local function set_active_playlist(guild_id, playlist_url, entries, requester_id, channel_id)
+  if not playlist_url or not entries or #entries == 0 then return end
+  q([[INSERT INTO tunestream_active_playlists (guild_id, bot_name, playlist_url, known_track_count, requester_id, channel_id)
+      VALUES (%s, 'tunestream', %s, %s, %s, %s)
+      ON CONFLICT (guild_id, bot_name) DO UPDATE SET playlist_url = EXCLUDED.playlist_url,
+        known_track_count = EXCLUDED.known_track_count, requester_id = EXCLUDED.requester_id, channel_id = EXCLUDED.channel_id]],
+    guild_id, playlist_url, math.min(#entries, PLAYLIST_SYNC_MAX_TRACKED), requester_id, channel_id)
+  q("DELETE FROM tunestream_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'tunestream'", guild_id)
+  for idx, t in ipairs(entries) do
+    if idx > PLAYLIST_SYNC_MAX_TRACKED then break end
+    q([[INSERT INTO tunestream_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+        VALUES (%s, 'tunestream', %s, %s, %s, %s, %s, %s, %s)]],
+      guild_id, playlist_url, idx - 1, playlist_track_key(t.uri, t.title), new_uid(), t.uri, t.title, requester_id)
+  end
+  playlist_missing_streak[guild_id] = nil
+end
+
+-- One sync cycle across every guild with a registered active playlist:
+-- re-extracts each playlist via Lavalink, multiset-diffs it against the
+-- last-known snapshot (tunestream_active_playlist_tracks), enqueues additions,
+-- and removes tracks that have been missing for 2 consecutive cycles
+-- (from both the live queue and its backup mirror) -- plus a loop-mode
+-- duplicate trim and a queue-health refill, matching the Python original.
+local function playlist_sync_tick()
+  local playlists = q("SELECT guild_id, playlist_url, known_track_count, requester_id, channel_id FROM tunestream_active_playlists WHERE bot_name = 'tunestream'") or {}
+  for _, prow in ipairs(playlists) do
+    local gid = prow.guild_id
+    local ok, err = pcall(function()
+      local result, lerr = bot.lavalink:load_tracks(prow.playlist_url)
+      local entries, _pname, uerr = unwrap_load_result(result)
+      if uerr or #entries == 0 then
+        log_warn("[%s] playlist sync: re-extract failed: %s", gid, tostring(uerr or lerr))
+        return
+      end
+      if #entries > PLAYLIST_SYNC_MAX_TRACKED then
+        local trimmed = {}
+        for i = 1, PLAYLIST_SYNC_MAX_TRACKED do trimmed[i] = entries[i] end
+        entries = trimmed
+      end
+
+      local current_rows = {}
+      local current_counts = {}
+      for _, t in ipairs(entries) do
+        local k = playlist_track_key(t.uri, t.title)
+        current_rows[#current_rows + 1] = { url = t.uri, title = t.title, key = k }
+        current_counts[k] = (current_counts[k] or 0) + 1
+      end
+
+      local previous_rows = q("SELECT track_key, track_uid, video_url, title, requester_id FROM tunestream_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'tunestream' ORDER BY position_idx ASC", gid) or {}
+      local previous_by_key = {}
+      local remaining_previous = {}
+      for _, p in ipairs(previous_rows) do
+        local k = trim(p.track_key or "")
+        previous_by_key[k] = previous_by_key[k] or {}
+        table.insert(previous_by_key[k], p)
+        remaining_previous[k] = (remaining_previous[k] or 0) + 1
+      end
+
+      local added_rows = {}
+      for _, r in ipairs(current_rows) do
+        if remaining_previous[r.key] and remaining_previous[r.key] > 0 then
+          remaining_previous[r.key] = remaining_previous[r.key] - 1
+        else
+          added_rows[#added_rows + 1] = r
+        end
+      end
+
+      local removed_counts = {}
+      local carry_forward = {}
+      local streaks = playlist_missing_streak[gid] or {}
+      for k, missing_n in pairs(remaining_previous) do
+        if missing_n > 0 then
+          local streak = (streaks[k] or 0) + 1
+          streaks[k] = streak
+          if streak >= 2 then
+            removed_counts[k] = missing_n
+          else
+            for i = 1, missing_n do
+              local p = previous_by_key[k] and previous_by_key[k][i]
+              if p then carry_forward[#carry_forward + 1] = p end
+            end
+          end
+        end
+      end
+      for k in pairs(current_counts) do streaks[k] = nil end
+      playlist_missing_streak[gid] = next(streaks) and streaks or nil
+
+      local purged_live, purged_backup = 0, 0
+      if next(removed_counts) ~= nil then
+        local budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local live_rows = q("SELECT id, video_url, title FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream' ORDER BY id ASC", gid) or {}
+        for _, lr in ipairs(live_rows) do
+          local k = playlist_track_key(lr.video_url, lr.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            q("DELETE FROM tunestream_queue WHERE id = %s AND guild_id = %s AND bot_name = 'tunestream'", lr.id, gid)
+            purged_live = purged_live + 1
+          end
+        end
+        budget = {}
+        for k, c in pairs(removed_counts) do budget[k] = c end
+        local backup_rows = q("SELECT id, video_url, title FROM tunestream_queue_backup WHERE guild_id = %s AND bot_name = 'tunestream' ORDER BY id ASC", gid) or {}
+        for _, br in ipairs(backup_rows) do
+          local k = playlist_track_key(br.video_url, br.title)
+          if budget[k] and budget[k] > 0 then
+            budget[k] = budget[k] - 1
+            q("DELETE FROM tunestream_queue_backup WHERE id = %s AND guild_id = %s AND bot_name = 'tunestream'", br.id, gid)
+            purged_backup = purged_backup + 1
+          end
+        end
+      end
+
+      if #added_rows > 0 then
+        for _, r in ipairs(added_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        snapshot_backup(gid)
+        if #added_rows > 1 then shuffle_queue(gid, true) end
+      end
+
+      -- Trim loop-mode duplicate live-queue copies down to at most 1 per track_key still in the playlist.
+      local trim_count = 0
+      local current_keys = {}
+      for _, r in ipairs(current_rows) do current_keys[r.key] = true end
+      local all_rows = q("SELECT id, video_url, title FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream' ORDER BY id ASC", gid) or {}
+      local seen = {}
+      for _, qr in ipairs(all_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if current_keys[k] then
+          if seen[k] then
+            q("DELETE FROM tunestream_queue WHERE id = %s AND guild_id = %s AND bot_name = 'tunestream'", qr.id, gid)
+            trim_count = trim_count + 1
+          else
+            seen[k] = true
+          end
+        end
+      end
+
+      -- Queue-health refill: independent of the diff above, top the live queue back up
+      -- if it's thinner than expected relative to the tracked playlist (drained by
+      -- playback/a bug/a restart without the source playlist itself changing).
+      local refilled = 0
+      local queued_rows = q("SELECT video_url, title FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream'", gid) or {}
+      local queued_keys = {}
+      local queued_n = 0
+      for _, qr in ipairs(queued_rows) do
+        local k = playlist_track_key(qr.video_url, qr.title)
+        if not queued_keys[k] then queued_keys[k] = true; queued_n = queued_n + 1 end
+      end
+      local target = math.min(#current_rows, PLAYLIST_QUEUE_MIN_TRACKS)
+      if queued_n < target then
+        local refill_rows = {}
+        for _, r in ipairs(current_rows) do
+          if queued_n + #refill_rows >= target then break end
+          if not queued_keys[r.key] then refill_rows[#refill_rows + 1] = r end
+        end
+        for _, r in ipairs(refill_rows) do enqueue_track(gid, r.url, r.title, prow.requester_id) end
+        if #refill_rows > 0 then
+          refilled = #refill_rows
+          snapshot_backup(gid)
+          shuffle_queue(gid, true)
+        end
+      end
+
+      if #added_rows > 0 or purged_live > 0 or purged_backup > 0 or trim_count > 0 or refilled > 0 then
+        log_info("[%s] playlist sync: +%d -%d(live) -%d(backup) trimmed=%d refilled=%d", gid, #added_rows, purged_live, purged_backup, trim_count, refilled)
+      end
+
+      -- Persist this cycle's confirmed tracks plus anything still in its missing-streak
+      -- grace window as the baseline the next cycle diffs against.
+      q("DELETE FROM tunestream_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+      local idx = 0
+      for _, r in ipairs(current_rows) do
+        q([[INSERT INTO tunestream_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'tunestream', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, r.key, new_uid(), r.url, r.title, prow.requester_id)
+        idx = idx + 1
+      end
+      for _, p in ipairs(carry_forward) do
+        q([[INSERT INTO tunestream_active_playlist_tracks (guild_id, bot_name, playlist_url, position_idx, track_key, track_uid, video_url, title, requester_id)
+            VALUES (%s, 'tunestream', %s, %s, %s, %s, %s, %s, %s)]],
+          gid, prow.playlist_url, idx, trim(p.track_key or ""), trim(col(p, "track_uid") or "") ~= "" and col(p, "track_uid") or new_uid(), p.video_url, p.title, p.requester_id)
+        idx = idx + 1
+      end
+      q("UPDATE tunestream_active_playlists SET known_track_count = %s WHERE guild_id = %s AND bot_name = 'tunestream'", idx, gid)
+    end)
+    if not ok then
+      log_warn("[%s] playlist sync tick error: %s", gid, tostring(err))
+      report_error(gid, "runtime", "playlist sync error", tostring(err))
+    end
+  end
 end
 
 -- ===========================================================================
@@ -1493,6 +1739,9 @@ bot:command(cmdname("play"), {
   for _, t in ipairs(entries) do enqueue_track(gid, t.uri, t.title, user_id) end
   if #entries > 1 then shuffle_queue(gid, true) end
   snapshot_backup(gid)
+  if playlist_name and is_playlist_source(search) then
+    set_active_playlist(gid, search, entries, user_id, channel_id)
+  end
   local qlen = queue_count(gid)
 
   local playing = playback[gid] ~= nil
@@ -1545,7 +1794,7 @@ function(_, interaction)
   if not is_dj(interaction) then return end
   local gid = guild_id_of(interaction)
   stop_playback(gid)
-  q("DELETE FROM tunestream_active_playlists WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+  clear_active_playlist(gid)
   ack_embed(interaction, embed("Music stopped and cleared.", { title = "\xE2\x8F\xB9\xEF\xB8\x8F Stopped", color = COLOR.red }), true)
 end)
 
@@ -1569,7 +1818,7 @@ bot:command(cmdname("sleep"), {
     if token.cancel then return end
     sleep_timers[gid] = nil
     stop_playback(gid)
-    q("DELETE FROM tunestream_active_playlists WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+    clear_active_playlist(gid)
     log_info("[%s] sleep timer elapsed, playback stopped", gid)
   end)
   ack_embed(interaction, embed(string.format("\xF0\x9F\x98\xB4 Sleep timer set for **%d** minute(s). Playback will stop automatically.", minutes), { color = COLOR.blue }), true)
@@ -1628,7 +1877,7 @@ function(_, interaction)
   if not is_dj(interaction) then return end
   local gid = guild_id_of(interaction)
   stop_playback(gid)
-  q("DELETE FROM tunestream_active_playlists WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+  clear_active_playlist(gid)
   q("DELETE FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
   q("DELETE FROM tunestream_queue_backup WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
   clear_playback_state(gid)
@@ -1654,7 +1903,7 @@ function(_, interaction)
   if not is_dj(interaction) then return end
   local gid = guild_id_of(interaction)
   stop_playback(gid)
-  q("DELETE FROM tunestream_active_playlists WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
+  clear_active_playlist(gid)
   q("DELETE FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
   q("DELETE FROM tunestream_queue_backup WHERE guild_id = %s AND bot_name = 'tunestream'", gid)
   bot.gateway:leave_voice(gid)
@@ -2629,6 +2878,55 @@ local function poll_swarm_overrides()
   end
 end
 
+-- SwarmPanel's control.lua also writes uppercase PLAY/RECOVER/LEAVE/SEEK
+-- rows to tunestream_swarm_direct_orders for source_url plays, fleet-
+-- supervisor recovery, forced disconnects, and seek-to-position -- none of
+-- the simpler overrides poller above covers these. Same claim-then-execute
+-- pattern.
+local function handle_direct_order(order)
+  local guild_id = tostring(order.guild_id)
+  local cmd = order.command
+  local ok, err = pcall(function()
+    if cmd == "PLAY" and order.data and order.vc_id and order.vc_id ~= "0" then
+      local entries, _pn, terr = search_playables(order.data)
+      if not entries or #entries == 0 then error("could not resolve source: " .. tostring(terr), 0) end
+      for _, e in ipairs(entries) do
+        enqueue_track(guild_id, e.uri, e.title, nil)
+      end
+      if #entries > 1 then shuffle_queue(guild_id, true) end
+      snapshot_backup(guild_id)
+      if not playback[guild_id] then process_queue(guild_id, order.vc_id) end
+    elseif cmd == "RECOVER" then
+      local channel_id = (order.vc_id and order.vc_id ~= "0" and order.vc_id) or get_home_channel_id(guild_id)
+      if channel_id and not playback[guild_id] then process_queue(guild_id, channel_id) end
+    elseif cmd == "LEAVE" then
+      stop_playback(guild_id)
+      bot.gateway:leave_voice(guild_id)
+    elseif cmd == "SEEK" and order.data then
+      local target_seconds = math.max(0, tonumber(order.data) or 0)
+      if playback[guild_id] then
+        bot.lavalink:seek(guild_id, target_seconds * 1000)
+        playback[guild_id].offset = target_seconds
+        playback[guild_id].start_time = socket.gettime()
+      end
+    end
+  end)
+  if not ok then
+    q("UPDATE tunestream_swarm_direct_orders SET attempts = attempts + 1, last_error = %s WHERE id = %s", tostring(err):sub(1, 500), order.id)
+  else
+    q("DELETE FROM tunestream_swarm_direct_orders WHERE id = %s", order.id)
+    send_webhook_log("\240\159\164\150 Aria Direct Order", ("Aria executed **%s** in guild %s."):format(cmd, guild_id), COLOR.purple)
+  end
+end
+
+local function poll_direct_orders()
+  local rows = q("SELECT id, guild_id, vc_id, text_channel_id, command, data FROM tunestream_swarm_direct_orders WHERE bot_name = 'tunestream' AND claimed_at IS NULL ORDER BY id ASC LIMIT 5") or {}
+  for _, order in ipairs(rows) do
+    q("UPDATE tunestream_swarm_direct_orders SET claimed_at = NOW() WHERE id = %s", order.id)
+    handle_direct_order(order)
+  end
+end
+
 local function start_background_loops()
   copas.addthread(function()
     while true do
@@ -2644,6 +2942,28 @@ local function start_background_loops()
       if not ok then
         log_warn("swarm override poll error: %s", tostring(err))
         report_error(nil, "runtime", "swarm override poll error", tostring(err))
+      end
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(5)
+      local ok, err = pcall(poll_direct_orders)
+      if not ok then
+        log_warn("direct order poll error: %s", tostring(err))
+        report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(PLAYLIST_SYNC_INTERVAL)
+      local ok, err = pcall(playlist_sync_tick)
+      if not ok then
+        log_warn("playlist sync tick error: %s", tostring(err))
+        report_error(nil, "runtime", "playlist sync tick error", tostring(err))
       end
     end
   end)
