@@ -1277,9 +1277,16 @@ end
 -- Pops the next track from tunestream_queue and starts it. If the queue is empty,
 -- tries to restore from tunestream_queue_backup (loop_mode == queue), else runs
 -- Auto-DJ, else disconnects (unless 24/7 mode is on).
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 local function process_queue(guild_id, channel_id)
   if process_queue_busy[guild_id] then return end
   process_queue_busy[guild_id] = true
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    process_queue_busy[guild_id] = nil
+    return
+  end
   local ok, err = pcall(function()
     local settings = get_settings(guild_id)
     local next_row = q1("SELECT id, video_url, title, requester_id, track_uid FROM tunestream_queue WHERE guild_id = %s AND bot_name = 'tunestream' ORDER BY id ASC LIMIT 1", guild_id)
@@ -1312,14 +1319,25 @@ local function process_queue(guild_id, channel_id)
     local url, title, requester_id = next_row.video_url, next_row.title, next_row.requester_id
     q("DELETE FROM tunestream_queue WHERE id = %s AND guild_id = %s AND bot_name = 'tunestream'", next_row.id, guild_id)
 
+    local retry_key = guild_id .. ":" .. tostring(track_uid or url)
     local result, lerr = bot.lavalink:load_tracks(url)
     local entries, _pn, uerr = unwrap_load_result(result)
     if uerr or #entries == 0 then
-      log_warn("[%s] track resolve failed for '%s': %s", guild_id, tostring(title), tostring(uerr or lerr))
-      -- Give up on this one track and move to the next rather than getting stuck.
+      local attempts = (resolve_attempts[retry_key] or 0) + 1
+      if attempts < MAX_RESOLVE_ATTEMPTS then
+        resolve_attempts[retry_key] = attempts
+        log_warn("[%s] resolve failed for '%s' (attempt %d/%d): %s -- requeuing", guild_id, tostring(title), attempts, MAX_RESOLVE_ATTEMPTS, tostring(uerr or lerr))
+        insert_queue_front(guild_id, url, title, requester_id, track_uid)
+        process_queue_busy[guild_id] = nil
+        return
+      end
+      resolve_attempts[retry_key] = nil
+      log_warn("[%s] giving up on '%s' after %d failed resolves: %s", guild_id, tostring(title), attempts, tostring(uerr or lerr))
+      report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(tostring(title), tostring(uerr or lerr)))
       copas.addthread(function() process_queue(guild_id, channel_id) end)
       return
     end
+    resolve_attempts[retry_key] = nil
     local track = entries[1]
 
     ensure_voice_connection(guild_id, channel_id)
@@ -1870,6 +1888,18 @@ end
 
 local function mark_voice_disconnected(guild_id)
   q([[UPDATE tunestream_voice_state SET desired_connected = false, connected_channel_id = NULL, disconnected_at = NOW() WHERE guild_id = %s AND bot_name = 'tunestream']], guild_id)
+end
+
+local function recovery_watchdog()
+  local stalled = q("SELECT DISTINCT guild_id FROM tunestream_queue WHERE bot_name = 'tunestream'") or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not playback[guild_id] then
+      local vrow = q1("SELECT connected_channel_id FROM tunestream_voice_state WHERE guild_id = %s AND bot_name = 'tunestream'", guild_id)
+      local channel_id = (vrow and vrow.connected_channel_id) or get_home_channel_id(guild_id)
+      if channel_id then process_queue(guild_id, channel_id) end
+    end
+  end
 end
 
 bot:command(cmdname("clear"), { description = "Clear the upcoming queue, stop playback, and reset stored playback state for this server." },
@@ -2953,6 +2983,16 @@ local function start_background_loops()
       if not ok then
         log_warn("direct order poll error: %s", tostring(err))
         report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+  copas.addthread(function()
+    while true do
+      copas.sleep(30)
+      local ok, err = pcall(recovery_watchdog)
+      if not ok then
+        log_warn("recovery_watchdog error: %s", tostring(err))
+        report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
       end
     end
   end)
