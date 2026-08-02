@@ -1194,7 +1194,17 @@ end
 
 local function ensure_voice_connection(guild_id, channel_id)
   bot.gateway:join_voice(guild_id, channel_id, false, false)
-  copas.sleep(0.5) -- give VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE a moment to land before we PATCH the player
+  -- Used to sleep 0.5s and return nothing (always falsy) -- every caller
+  -- that checked the return value (the Lavalink-restart recovery handler)
+  -- was silently dead code, never actually resuming playback after a node
+  -- restart. Now actually waits for VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE
+  -- to land (bot.voice_state[guild_id].session_id) and reports success.
+  local waited = 0
+  while waited < 8 and not (bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id) do
+    copas.sleep(0.25)
+    waited = waited + 0.25
+  end
+  return bot.voice_state[guild_id] and bot.voice_state[guild_id].session_id ~= nil
 end
 
 function new_uid_label(uid)
@@ -1340,7 +1350,11 @@ local function process_queue(guild_id, channel_id)
     resolve_attempts[retry_key] = nil
     local track = entries[1]
 
-    ensure_voice_connection(guild_id, channel_id)
+    if not ensure_voice_connection(guild_id, channel_id) then
+      log_warn("[%s] Voice connection unavailable; requeueing '%s'", guild_id, tostring(title))
+      insert_queue_front(guild_id, url, title, requester_id, track_uid)
+      return
+    end
 
     local filters = {}
     local speed = 1.0
@@ -1361,11 +1375,16 @@ local function process_queue(guild_id, channel_id)
     local use_fade = settings.transition_mode == "fade" or settings.transition_mode == "smart" or settings.transition_mode == "mix"
     local target_volume = settings.volume
 
-    bot.lavalink:update_player(guild_id, {
+    local play_ok, play_err = bot.lavalink:update_player(guild_id, {
       encodedTrack = track.encoded,
       volume = use_fade and 0 or target_volume,
       filters = filters,
     })
+    if not play_ok then
+      log_warn("[%s] Playback start failed for '%s': %s", guild_id, tostring(track.title or title), tostring(play_err))
+      insert_queue_front(guild_id, track.uri or url, track.title or title, requester_id, track_uid)
+      return
+    end
 
     update_stage_topic(guild_id, channel_id, track.title or title)
 
@@ -2927,7 +2946,14 @@ local function poll_swarm_overrides()
     if executed then
       send_webhook_log("\240\159\164\150 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
     end
-    q("DELETE FROM tunestream_swarm_overrides WHERE guild_id = %s AND bot_name = 'tunestream' AND command = %s", guild_id, row.command)
+    -- Only clear the override once it actually ran -- it used to be
+    -- deleted unconditionally, so a command whose guard didn't match yet
+    -- (e.g. PAUSE arriving before playback[guild_id] was populated, a real
+    -- race right after a container restart) was silently dropped forever
+    -- instead of being retried on the next poll.
+    if executed then
+      q("DELETE FROM tunestream_swarm_overrides WHERE guild_id = %s AND bot_name = 'tunestream' AND command = %s", guild_id, row.command)
+    end
   end
 end
 
